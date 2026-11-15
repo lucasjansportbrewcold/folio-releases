@@ -1,0 +1,252 @@
+# THE WORKFLOW OF THE PUBLIC REPOSITORY folio-releases (.github/workflows/build.yml).
+# The source of truth is apps/desktop/release/build.yml in the private repository agentic-office;
+# a change there is copied to folio-releases by hand (apps/desktop/README.md, "How a version is made").
+#
+# Builds Folio for Windows and for Mac (one universal app, Apple silicon and Intel) from the
+# private source, and publishes both as one release: v<version> with the installers, the updates
+# and latest.json, which every installed Folio reads. It runs here, in a public repository,
+# because Actions minutes of public repositories are free (Mac minutes count ten times in a
+# private one).
+#
+# What may be public here and what may not:
+#  - the source is checked out with FOLIO_SOURCE_TOKEN (read-only, agentic-office only) and is
+#    never uploaded: the only artifacts are the installers (published anyway) and a screenshot;
+#  - nothing is cached: no cache of this public repository holds anything built from the source;
+#  - it starts only from agentic-office (repository_dispatch) or from someone who may write to
+#    this repository (Run workflow); there is no pull_request trigger, so a fork can not start it
+#    with the secrets;
+#  - the logs are public: a failing compile can show a few lines of code in them. (The installers
+#    contain the bundled server as JavaScript anyway.)
+#
+# Secrets of this repository:
+#   FOLIO_SOURCE_TOKEN         fine-grained token, repository agentic-office only, Contents: read
+#   TAURI_SIGNING_PRIVATE_KEY  the private half of the update key (public half in tauri.conf.json)
+name: Build and publish Folio
+
+on:
+  repository_dispatch:
+    types: [folio-build]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit of agentic-office to build (the full 40 characters)
+        required: true
+      version:
+        description: Version, higher than the newest release (like 0.1.57)
+        required: true
+
+permissions:
+  contents: read
+
+# one build at a time; a newer one waits (only the newest waiting one is kept)
+concurrency:
+  group: folio-build
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: lucasjansportbrewcold/agentic-office
+  FOLIO_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  FOLIO_VERSION: ${{ github.event.client_payload.version || inputs.version }}
+  PUBLISH: 'true'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check what is asked for
+        run: |
+          [[ "$FOLIO_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit: $FOLIO_SHA"; exit 1; }
+          [[ "$FOLIO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a version: $FOLIO_VERSION"; exit 1; }
+          echo "Folio $FOLIO_VERSION from $FOLIO_SHA"
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.FOLIO_SHA }}
+          token: ${{ secrets.FOLIO_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the components
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the web app
+        run: npm run build
+
+      - name: Bundle the server
+        run: node apps/desktop/scripts/bundle-server.mjs
+
+      - name: Add Node itself
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force apps/desktop/dist/node | Out-Null
+          Copy-Item (Get-Command node.exe).Source apps/desktop/dist/node/node.exe
+          $license = Join-Path (Split-Path (Get-Command node.exe).Source) 'LICENSE'
+          if (Test-Path $license) { Copy-Item $license apps/desktop/dist/node/LICENSE }
+          apps/desktop/dist/node/node.exe --version
+
+      - name: Check that the bundled server runs with it
+        run: node apps/desktop/scripts/smoke.mjs apps/desktop/dist/node/node.exe
+
+      - name: Set the version
+        run: node apps/desktop/scripts/release.mjs config
+
+      - name: Build the installer
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npx --yes @tauri-apps/cli@2 build --config dist/tauri.release.conf.json
+
+      - name: Start the app, look at it, close it
+        shell: pwsh
+        run: apps/desktop/scripts/smoke-app.ps1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-window-windows
+          path: apps/desktop/dist/app-window.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: folio-windows
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+          if-no-files-found: error
+          retention-days: 3
+
+  macos:
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.FOLIO_SHA }}
+          token: ${{ secrets.FOLIO_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the components
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the web app
+        run: npm run build
+
+      - name: Bundle the server
+        run: node apps/desktop/scripts/bundle-server.mjs
+
+      # the Node of both kinds of Mac in one file, the same version as the one building here
+      - name: Add Node itself (Apple silicon and Intel)
+        run: |
+          v="$(node --version)"
+          work="$(mktemp -d)"
+          for arch in arm64 x64; do
+            curl -fsSL "https://nodejs.org/dist/$v/node-$v-darwin-$arch.tar.gz" | tar -xz -C "$work"
+          done
+          mkdir -p apps/desktop/dist/node
+          lipo -create "$work/node-$v-darwin-arm64/bin/node" "$work/node-$v-darwin-x64/bin/node" -output apps/desktop/dist/node/node
+          cp "$work/node-$v-darwin-arm64/LICENSE" apps/desktop/dist/node/LICENSE
+          # one signature for the joined file (ad hoc, like the app around it)
+          codesign --force --sign - apps/desktop/dist/node/node
+          lipo apps/desktop/dist/node/node -verify_arch arm64 x86_64
+          apps/desktop/dist/node/node --version
+
+      - name: Check that the bundled server runs with it
+        run: node apps/desktop/scripts/smoke.mjs apps/desktop/dist/node/node
+
+      - name: Add the Rust targets of both kinds of Mac
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Set the version
+        run: node apps/desktop/scripts/release.mjs config
+
+      - name: Build the app
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npx --yes @tauri-apps/cli@2 build --target universal-apple-darwin --config dist/tauri.release.conf.json
+
+      - name: Start the app, look at it, close it
+        run: bash apps/desktop/scripts/smoke-app-macos.sh apps/desktop/dist/app-window-macos.png
+
+      - name: Name the update after its version
+        run: node apps/desktop/scripts/release.mjs collect-macos
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-window-macos
+          path: apps/desktop/dist/app-window-macos.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: folio-macos
+          path: apps/desktop/dist/macos/
+          if-no-files-found: error
+          retention-days: 3
+
+  # one release with what was built; a Mac build that failed does not hold back Windows
+  publish:
+    needs: [windows, macos]
+    if: always() && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # only the release script, not the source
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.FOLIO_SHA }}
+          token: ${{ secrets.FOLIO_SOURCE_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: apps/desktop/scripts/release.mjs
+          sparse-checkout-cone-mode: false
+          path: source
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: folio-*
+          path: out
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node source/apps/desktop/scripts/release.mjs manifest out
+          cd out
+          mac="no Mac version this time (its build failed)"
+          if ls *.dmg >/dev/null 2>&1; then
+            cp Folio_*_universal.dmg Folio-macOS.dmg
+            mac="**Mac** (Apple silicon and Intel): Folio-macOS.dmg"
+          fi
+          cp *-setup.exe Folio-Windows-setup.exe
+          # the files people download, and the files the installed apps update from
+          shopt -s nullglob
+          files=(*-setup.exe *.dmg *.app.tar.gz latest.json)
+          printf '%s\n' "Folio $FOLIO_VERSION. An installed Folio updates itself. For a first install:" "" \
+            "- **Windows**: Folio-Windows-setup.exe" "- $mac" > notes.md
+          gh release create "v$FOLIO_VERSION" "${files[@]}" --repo "$GITHUB_REPOSITORY" --title "Folio $FOLIO_VERSION" --notes-file notes.md
