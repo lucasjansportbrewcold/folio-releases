@@ -19,7 +19,7 @@
 #    contain the bundled server as JavaScript anyway.)
 #
 # Secrets of this repository:
-#   FOLIO_SOURCE_TOKEN         fine-grained token, repository agentic-office only, Contents: read
+#   FOLIO_SOURCE_TOKEN         fine-grained token that may read agentic-office (Contents: read)
 #   TAURI_SIGNING_PRIVATE_KEY  the private half of the update key (public half in tauri.conf.json)
 name: Build and publish Folio
 
